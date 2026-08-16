@@ -54,6 +54,7 @@ from exo.worker.engines.mlx.constants import (
     KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+    get_prefill_step_size,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -331,7 +332,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    prefill_step_size = get_prefill_step_size()
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -711,7 +712,6 @@ def mlx_generate(
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""
-    generated_text_parts: list[str] = []
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
     logger.info("Starting decode")
@@ -732,8 +732,8 @@ def mlx_generate(
         ),
         start=1,
     ):
-        generated_text_parts.append(out.text)
-        accumulated_text += out.text
+        if stop_sequences:
+            accumulated_text += out.text
 
         # Check for stop sequences
         text = out.text
@@ -796,7 +796,7 @@ def mlx_generate(
         if is_done:
             # Log generation stats
             generation_elapsed = time.perf_counter() - generation_start_time
-            generated_tokens = len(generated_text_parts)
+            generated_tokens = completion_tokens
             generation_tps = (
                 generated_tokens / generation_elapsed if generation_elapsed > 0 else 0.0
             )

@@ -202,6 +202,14 @@ uv run --extra mlx-cuda13 python -c "import mlx.core as mx; print('MLX CUDA avai
 
 Use `mlx-cuda12` in the verification command when CUDA 12 is selected. When MLX reports CUDA availability, exo advertises the `MlxCuda` backend automatically and CUDA-compatible model cards can be placed on that node.
 
+On CUDA nodes, exo uses a larger prefill chunk by default to improve prompt throughput. If a model or GPU has a different memory/performance profile, override it without changing the code:
+
+```bash
+EXO_PREFILL_STEP_SIZE=4096 uv run exo
+```
+
+The automatic CUDA default is 8192 tokens and the CPU default is 4096 tokens. A smaller value reduces peak working-set size; a larger value may improve prompt throughput when sufficient memory is available.
+
 Start exo with the selected environment:
 
 ```bash
