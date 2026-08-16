@@ -372,7 +372,6 @@ def _has_mlx_cuda() -> bool:
         return False
 
 
-
 class NodeBackends(TaggedModel):
     backends: list[Backend]
 

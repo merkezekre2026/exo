@@ -474,7 +474,7 @@ class ExoBatchGenerator:
                 and len(state.potential_stop_sequence_text) > state.max_stop_len
             ):
                 state.potential_stop_sequence_text = state.potential_stop_sequence_text[
-                    -state.max_stop_len:
+                    -state.max_stop_len :
                 ]
 
         _step_elapsed = time.perf_counter() - _step_tic
