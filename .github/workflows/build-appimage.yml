@@ -1,0 +1,148 @@
+name: Build Linux AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      mlx_extra:
+        description: MLX backend to bundle into the AppImage
+        required: true
+        default: mlx-cpu
+        type: choice
+        options:
+          - mlx-cpu
+          - mlx-cuda12
+          - mlx-cuda13
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-appimage:
+    name: Build Linux AppImage (${{ inputs.mlx_extra || 'mlx-cpu' }})
+    runs-on: ubuntu-22.04
+    env:
+      MLX_EXTRA: ${{ inputs.mlx_extra || 'mlx-cpu' }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes curl ca-certificates file desktop-file-utils
+
+      - name: Install Python dependencies
+        run: |
+          uv python install 3.13
+          uv sync --locked --group dev --extra "$MLX_EXTRA"
+
+      - name: Build dashboard
+        working-directory: dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build PyInstaller bundle
+        run: uv run --locked --extra "$MLX_EXTRA" pyinstaller packaging/pyinstaller/exo.spec
+
+      - name: Assemble AppDir and build AppImage
+        id: appimage
+        env:
+          APPIMAGETOOL_VERSION: 1.9.1
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            APPIMAGE_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            APPIMAGE_VERSION="0.0.0"
+          fi
+
+          APPDIR="$RUNNER_TEMP/EXO.AppDir"
+          OUTPUT="$RUNNER_TEMP/EXO-${APPIMAGE_VERSION}-${MLX_EXTRA}-x86_64.AppImage"
+          rm -rf "$APPDIR"
+          mkdir -p \
+            "$APPDIR/usr/lib" \
+            "$APPDIR/usr/bin" \
+            "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+          # PyInstaller's one-directory bundle contains the MLX runtime,
+          # dashboard, resources, and the exo executable.
+          cp -a dist/exo "$APPDIR/usr/lib/exo"
+          ln -s ../lib/exo/exo "$APPDIR/usr/bin/exo"
+
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          HERE="$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+          exec "$HERE/usr/bin/exo" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+          cat > "$APPDIR/usr/share/applications/exo.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=EXO
+          Comment=Distributed local AI inference
+          Exec=exo
+          TryExec=exo
+          Icon=exo
+          Terminal=true
+          Categories=Utility;
+          X-AppImage-Integrate=true
+          EOF
+
+          install -Dm644 dashboard/exo-logo-hq-square-black-bg.png \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps/exo.png"
+          cp "$APPDIR/usr/share/applications/exo.desktop" "$APPDIR/exo.desktop"
+          cp dashboard/exo-logo-hq-square-black-bg.png "$APPDIR/exo.png"
+
+          desktop-file-validate "$APPDIR/exo.desktop"
+
+          TOOL="$RUNNER_TEMP/appimagetool-x86_64.AppImage"
+          curl --fail --location --retry 3 --output "$TOOL" \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          chmod +x "$TOOL"
+
+          # APPIMAGE_EXTRACT_AND_RUN avoids requiring FUSE on the GitHub runner.
+          ARCH=x86_64 \
+          VERSION="$APPIMAGE_VERSION" \
+          APPIMAGETOOL_APP_NAME=EXO \
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+          "$TOOL" --no-appstream "$APPDIR" "$OUTPUT"
+
+          sha256sum "$OUTPUT" > "$OUTPUT.sha256"
+          echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "checksum=$OUTPUT.sha256" >> "$GITHUB_OUTPUT"
+          echo "Built $OUTPUT"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXO-AppImage-${{ env.MLX_EXTRA }}-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            ${{ steps.appimage.outputs.path }}
+            ${{ steps.appimage.outputs.checksum }}

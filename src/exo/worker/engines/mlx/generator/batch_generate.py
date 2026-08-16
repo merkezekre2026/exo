@@ -32,7 +32,11 @@ from exo.worker.engines.mlx.cache import (
     encode_prompt,
     make_kv_cache,
 )
-from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
+from exo.worker.engines.mlx.constants import (
+    DEFAULT_TOP_LOGPROBS,
+    MAX_TOKENS,
+    get_prefill_step_size,
+)
 from exo.worker.engines.mlx.generator.generate import (
     ban_token_ids,
     eos_ids_from_tokenizer,
@@ -62,12 +66,12 @@ _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
 
 
-def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
+def _stop_sequences(task_params: TextGenerationTaskParams) -> tuple[str, ...]:
     if task_params.stop is None:
-        return []
+        return ()
     if isinstance(task_params.stop, str):
-        return [task_params.stop]
-    return task_params.stop
+        return (task_params.stop,)
+    return tuple(task_params.stop)
 
 
 @dataclass
@@ -78,8 +82,9 @@ class _EngineTask:
     prefix_hit_length: int
     matched_index: int | None
     detokenizer: StreamingDetokenizer
+    stop_sequences: tuple[str, ...] = ()
+    max_stop_len: int = 0
     on_generation_token: Callable[[], None] | None = None
-    generated_text_parts: list[str] = field(default_factory=list)
     potential_stop_sequence_text: str = ""
     completion_tokens: int = 0
     generation_start_time: float = 0.0
@@ -105,7 +110,7 @@ class ExoBatchGenerator:
         self._mlx_gen = MlxBatchGenerator(
             model=self.model,
             stop_tokens=[[t] for t in eos_ids_from_tokenizer(self.tokenizer)],
-            prefill_step_size=4096,
+            prefill_step_size=get_prefill_step_size(),
         )
         self._step_count = 0
 
@@ -155,6 +160,8 @@ class ExoBatchGenerator:
             media_regions = vision.media_regions
 
         is_bench = task_params.bench
+        stop_sequences = _stop_sequences(task_params)
+        max_stop_len = max((len(s) for s in stop_sequences), default=0)
 
         prefix_hit_length = 0
         matched_index: int | None = None
@@ -317,6 +324,8 @@ class ExoBatchGenerator:
             prefix_hit_length=prefix_hit_length,
             matched_index=matched_index,
             detokenizer=self.tokenizer.detokenizer,
+            stop_sequences=stop_sequences,
+            max_stop_len=max_stop_len,
             on_generation_token=on_generation_token,
             generation_start_time=time.perf_counter(),
             prefill_tps=_prefill_tps,
@@ -368,18 +377,15 @@ class ExoBatchGenerator:
                 logger.debug(
                     f"[bench] uid={response.uid} tok#{state.completion_tokens} {text!r} t={delta:.4f}s"
                 )
-            state.generated_text_parts.append(text)
-            state.potential_stop_sequence_text += text
+            if state.stop_sequences:
+                state.potential_stop_sequence_text += text
 
             finish_reason: FinishReason | None = cast(
                 FinishReason | None, response.finish_reason
             )
             task_params = state.task_params
-            stop_sequences = _stop_sequences(task_params)
-            max_stop_len = max((len(s) for s in stop_sequences), default=0)
-
-            if stop_sequences:
-                for stop_seq in stop_sequences:
+            if state.stop_sequences:
+                for stop_seq in state.stop_sequences:
                     if stop_seq in state.potential_stop_sequence_text:
                         stop_index = state.potential_stop_sequence_text.find(stop_seq)
                         text_before_stop = state.potential_stop_sequence_text[
@@ -464,11 +470,11 @@ class ExoBatchGenerator:
             if is_done:
                 del self._active_tasks[response.uid]
             elif (
-                max_stop_len > 0
-                and len(state.potential_stop_sequence_text) > max_stop_len
+                state.max_stop_len > 0
+                and len(state.potential_stop_sequence_text) > state.max_stop_len
             ):
                 state.potential_stop_sequence_text = state.potential_stop_sequence_text[
-                    -max_stop_len:
+                    -state.max_stop_len :
                 ]
 
         _step_elapsed = time.perf_counter() - _step_tic

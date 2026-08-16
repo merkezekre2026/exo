@@ -354,18 +354,21 @@ async def _gather_iface_map() -> dict[str, str] | None:
     return ports
 
 
-def _has_nvml_cuda() -> bool:
+def _has_mlx_cuda() -> bool:
+    """Return whether the installed MLX build can execute on a CUDA device.
+
+    Checking MLX itself avoids advertising ``MlxCuda`` when a host has an
+    NVIDIA driver but the selected MLX extra is CPU-only.
+    """
     try:
-        import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
+        import mlx.core as mx
     except ImportError:
         return False
+
     try:
-        nvml.nvmlInit()
-        try:
-            return nvml.nvmlDeviceGetCount() > 0
-        finally:
-            nvml.nvmlShutdown()
+        return bool(mx.cuda.is_available())
     except Exception:
+        logger.opt(exception=True).debug("Unable to query MLX CUDA availability")
         return False
 
 
@@ -377,7 +380,7 @@ class NodeBackends(TaggedModel):
         backends: list[Backend] = [Backend.MlxCpu]
         if IS_DARWIN:
             backends.append(Backend.MlxMetal)
-        if await to_thread.run_sync(_has_nvml_cuda):
+        if await to_thread.run_sync(_has_mlx_cuda):
             backends.append(Backend.MlxCuda)
             backends.append(Backend.Vllm)
         return cls(backends=backends)

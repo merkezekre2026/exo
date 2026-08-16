@@ -142,12 +142,16 @@ This starts the exo dashboard and API at http://localhost:52415/
 **Prerequisites:**
 
 - [uv](https://github.com/astral-sh/uv) (for Python dependency management)
+- Python **3.13** (the version required by this repository)
 - [node](https://github.com/nodejs/node) (for building the dashboard) - version 18 or higher
 - [rust](https://github.com/rust-lang/rustup) (to build Rust bindings, nightly for now)
 
+The `macmon` package is macOS-only and is not required on Linux.
+
 **Installation methods:**
 
-**Option 1: Using system package manager (Ubuntu/Debian example):**
+**Option 1: Using a system package manager (Ubuntu/Debian example):**
+
 ```bash
 # Install Node.js and npm
 sudo apt update
@@ -161,37 +165,81 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup toolchain install nightly
 ```
 
-**Option 2: Using Homebrew on Linux (if preferred):**
+**Option 2: Using Homebrew on Linux:**
+
 ```bash
-# Install Homebrew on Linux
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Install dependencies
 brew install uv node
-
-# Install Rust (using rustup)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup toolchain install nightly
 ```
 
-**Note:** The `macmon` package is macOS-only and not required for Linux.
-
-Clone the repo, build the dashboard, and run exo:
+Clone the repository and build the dashboard:
 
 ```bash
-# Clone exo
 git clone https://github.com/exo-explore/exo
-
-# Build dashboard
 cd exo/dashboard && npm install && npm run build && cd ..
+```
 
-# Run exo
+#### NVIDIA CUDA backend
+
+Linux NVIDIA GPUs can run exo through MLX's CUDA backend. The repository provides separate extras for CUDA 12 and CUDA 13; install exactly one of them before starting exo:
+
+```bash
+# CUDA 12 (NVIDIA driver >= 550.54.14, CUDA toolkit >= 12.0)
+uv sync --extra mlx-cuda12
+
+# Or CUDA 13 (NVIDIA driver >= 580, or a compatible CUDA-compat package)
+uv sync --extra mlx-cuda13
+```
+
+The CUDA wheels require a Linux distribution with glibc >= 2.35, Python >= 3.10, and an NVIDIA GPU with compute capability SM 7.5 or newer. The project itself currently requires Python 3.13. Verify that the driver is visible before launching exo:
+
+```bash
+nvidia-smi
+uv run --extra mlx-cuda13 python -c "import mlx.core as mx; print('MLX CUDA available:', mx.cuda.is_available())"
+```
+
+Use `mlx-cuda12` in the verification command when CUDA 12 is selected. When MLX reports CUDA availability, exo advertises the `MlxCuda` backend automatically and CUDA-compatible model cards can be placed on that node.
+
+On CUDA nodes, exo uses a larger prefill chunk by default to improve prompt throughput. If a model or GPU has a different memory/performance profile, override it without changing the code:
+
+```bash
+EXO_PREFILL_STEP_SIZE=4096 uv run exo
+```
+
+The automatic CUDA profile is memory-aware: 2048 tokens for devices up to 6 GiB, 4096 tokens for devices up to 12 GiB, and 8192 tokens above 12 GiB. This keeps entry-level cards such as 4 GiB GTX 1650 variants from taking the larger working-set path by default. The CPU default is 4096 tokens. A smaller value reduces peak working-set size; a larger value may improve prompt throughput when sufficient memory is available.
+
+Start exo with the selected environment:
+
+```bash
 uv run exo
 ```
 
-This starts the exo dashboard and API at http://localhost:52415/
+For a Nix-based Linux installation, the CUDA 13 package is also available:
 
-**Important note for Linux users:** Currently, exo runs on CPU on Linux. GPU support for Linux platforms is under development. If you'd like to see support for your specific Linux hardware, please [search for existing feature requests](https://github.com/exo-explore/exo/issues) or create a new one.
+```bash
+nix run .#exo-cuda-13
+```
+
+The default `nix run .#exo` package remains CPU-only. CUDA 12 is available through the uv extra; a separate Nix CUDA 12 package is not currently published.
+
+#### CPU-only fallback
+
+If no CUDA extra is selected, install the CPU backend explicitly:
+
+```bash
+uv sync --extra mlx-cpu
+uv run exo
+```
+
+This starts the exo dashboard and API at http://localhost:52415/. If `MlxCuda` does not appear after selecting a CUDA extra, first confirm `nvidia-smi` and the MLX availability command above. A CPU-only MLX installation intentionally advertises only `MlxCpu`.
+
+#### Linux AppImage
+
+The repository includes a GitHub Actions workflow at `.github/workflows/build-appimage.yml`. Run it manually from the **Actions** tab and select `mlx-cpu`, `mlx-cuda12`, or `mlx-cuda13`; it also runs automatically for `v*` tags. The resulting x86_64 AppImage and SHA-256 checksum are uploaded as workflow artifacts.
+
+The AppImage bundles the Python runtime, MLX package, dashboard, and model resources. NVIDIA drivers and the CUDA kernel driver are host requirements and are not bundled into the AppImage. For a CUDA build, use a host with a compatible NVIDIA driver and select the matching CUDA extra when dispatching the workflow.
 
 **Configuration Options:**
 
