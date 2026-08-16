@@ -3,18 +3,52 @@
 import os
 
 CPU_PREFILL_STEP_SIZE = 4096
-CUDA_PREFILL_STEP_SIZE = 8192
+CUDA_LOW_VRAM_PREFILL_STEP_SIZE = 2048
+CUDA_DEFAULT_PREFILL_STEP_SIZE = 4096
+CUDA_HIGH_VRAM_PREFILL_STEP_SIZE = 8192
+CUDA_LOW_VRAM_LIMIT_BYTES = 6 * 1024**3
+CUDA_HIGH_VRAM_LIMIT_BYTES = 12 * 1024**3
+
+
+def get_prefill_step_size_for_memory(memory_size_bytes: int | None) -> int:
+    """Select a conservative prompt chunk for the detected CUDA memory size."""
+    if memory_size_bytes is None:
+        # Unknown CUDA devices use the middle profile rather than risking the
+        # larger allocation on an entry-level card.
+        return CUDA_DEFAULT_PREFILL_STEP_SIZE
+    if memory_size_bytes <= CUDA_LOW_VRAM_LIMIT_BYTES:
+        return CUDA_LOW_VRAM_PREFILL_STEP_SIZE
+    if memory_size_bytes <= CUDA_HIGH_VRAM_LIMIT_BYTES:
+        return CUDA_DEFAULT_PREFILL_STEP_SIZE
+    return CUDA_HIGH_VRAM_PREFILL_STEP_SIZE
+
+
+def _cuda_memory_size() -> int | None:
+    """Return the active CUDA device memory size when MLX exposes it."""
+    try:
+        import mlx.core as mx  # pyright: ignore[reportMissingModuleSource]
+
+        if not mx.cuda.is_available():
+            return None
+        raw_memory_size = mx.device_info().get("memory_size")
+        if isinstance(raw_memory_size, int):
+            return raw_memory_size
+        if isinstance(raw_memory_size, str):
+            return int(raw_memory_size)
+    except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
+        pass
+    return None
 
 
 def get_prefill_step_size() -> int:
     """Return the prompt chunk size used by local and batched prefill.
 
-    CUDA uses a larger default chunk to improve prompt throughput, while the
-    smaller CPU default keeps peak working-set growth bounded. The
-    ``EXO_PREFILL_STEP_SIZE`` override is an escape hatch for models or GPUs
-    whose memory/performance profile differs from the defaults. Invalid
-    overrides are ignored so a malformed environment cannot prevent a worker
-    from starting.
+    CUDA uses a memory-aware chunk: 2048 tokens for devices up to 6 GiB,
+    4096 tokens up to 12 GiB, and 8192 tokens above that. The smaller CPU
+    default keeps peak working-set growth bounded. ``EXO_PREFILL_STEP_SIZE``
+    overrides the automatic profile for model- or workload-specific tuning.
+    Invalid overrides are ignored so a malformed environment cannot prevent a
+    worker from starting.
     """
     override = os.environ.get("EXO_PREFILL_STEP_SIZE")
     if override is not None:
@@ -29,7 +63,7 @@ def get_prefill_step_size() -> int:
         import mlx.core as mx  # pyright: ignore[reportMissingModuleSource]
 
         if mx.cuda.is_available():
-            return CUDA_PREFILL_STEP_SIZE
+            return get_prefill_step_size_for_memory(_cuda_memory_size())
     except Exception:
         # A missing/incompatible driver should fall back to the CPU chunk size.
         pass

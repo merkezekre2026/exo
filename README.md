@@ -208,7 +208,7 @@ On CUDA nodes, exo uses a larger prefill chunk by default to improve prompt thro
 EXO_PREFILL_STEP_SIZE=4096 uv run exo
 ```
 
-The automatic CUDA default is 8192 tokens and the CPU default is 4096 tokens. A smaller value reduces peak working-set size; a larger value may improve prompt throughput when sufficient memory is available.
+The automatic CUDA profile is memory-aware: 2048 tokens for devices up to 6 GiB, 4096 tokens for devices up to 12 GiB, and 8192 tokens above 12 GiB. This keeps entry-level cards such as 4 GiB GTX 1650 variants from taking the larger working-set path by default. The CPU default is 4096 tokens. A smaller value reduces peak working-set size; a larger value may improve prompt throughput when sufficient memory is available.
 
 Start exo with the selected environment:
 
