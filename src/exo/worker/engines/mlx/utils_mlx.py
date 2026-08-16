@@ -1,10 +1,11 @@
+import contextlib
 import json
 import os
 import re
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -28,14 +29,12 @@ from mlx_lm.models.deepseek_v3 import DeepseekV3Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.models.model_cards import ModelId
-from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
+from exo.worker.engines.mlx.constants import MTP_ENABLED, TRUST_REMOTE_CODE
 
 try:
     from mlx_lm.tokenizer_utils import load_tokenizer
 except ImportError:
     from mlx_lm.tokenizer_utils import load as load_tokenizer
-import contextlib
-
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.utils import load_model
@@ -66,6 +65,152 @@ from exo.worker.engines.mlx.auto_parallel import (
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
+
+_MTP_LAYER_INDEX = 61
+_original_deepseek_sanitize: Callable[..., dict[str, mx.array]] | None = None
+
+
+def _patch_deepseek_sanitize_for_mtp() -> None:
+    global _original_deepseek_sanitize
+    if _original_deepseek_sanitize is not None:
+        return
+
+    original = cast(
+        Callable[..., dict[str, mx.array]],
+        DeepseekV3Model.sanitize,  # type: ignore[attr-defined]
+    )
+    _original_deepseek_sanitize = original
+
+    def sanitize_with_mtp(
+        self: DeepseekV3Model,
+        weights: dict[str, mx.array],
+    ) -> dict[str, mx.array]:
+        if _original_deepseek_sanitize is None:
+            raise RuntimeError("DeepSeek sanitize patch is not initialized")
+        sanitized = _original_deepseek_sanitize(self, weights)
+        auxiliary = {
+            key: value
+            for key, value in weights.items()
+            if key.startswith(f"model.layers.{_MTP_LAYER_INDEX}.")
+        }
+        return {**sanitized, **auxiliary}
+
+    DeepseekV3Model.sanitize = sanitize_with_mtp  # type: ignore[assignment,attr-defined]
+
+
+def _is_deepseek_v3_model(model: nn.Module) -> bool:
+    inner = getattr(model, "model", None)
+    return isinstance(inner, DeepseekV3Model)
+
+
+def _flatten_mx_parameter_tree(
+    value: object,
+    prefix: str = "",
+) -> dict[str, mx.array]:
+    if isinstance(value, dict):
+        mapping = cast(dict[object, object], value)
+        result: dict[str, mx.array] = {}
+        for key, child in mapping.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            result.update(_flatten_mx_parameter_tree(child, child_prefix))
+        return result
+    if isinstance(value, (list, tuple)):
+        sequence = cast(Sequence[object], value)
+        result = {}
+        for index, child in enumerate(sequence):
+            child_prefix = f"{prefix}.{index}" if prefix else str(index)
+            result.update(_flatten_mx_parameter_tree(child, child_prefix))
+        return result
+    if isinstance(value, mx.array):
+        return {prefix: value}
+    return {}
+
+
+def _extract_deepseek_mtp_module(model: nn.Module) -> nn.Module | None:
+    """Detach DeepSeek V3's auxiliary MTP layer before model sharding.
+
+    DeepSeek checkpoints store the MTP block as ``model.layers.61`` while the
+    normal transformer has 61 layers. Keeping this block in the main layer list
+    would make pipeline placement assign different model definitions to ranks.
+    The helper therefore extracts it once, removes it from the main model, and
+    attaches the identical auxiliary module to every rank.
+    """
+    if not _is_deepseek_v3_model(model):
+        return None
+
+    from exo.worker.engines.mlx.mtp.module import (
+        MTPModule,
+        extract_mtp_weights,
+        load_mtp_weights_into_module,
+    )
+
+    inner = cast(nn.Module, model.model)
+    raw_layers = getattr(inner, "layers", None)
+    if not isinstance(raw_layers, list):
+        logger.debug("DeepSeek model has no list-based transformer layers")
+        return None
+    layers = cast(list[nn.Module], raw_layers)
+    if len(layers) <= _MTP_LAYER_INDEX:
+        logger.debug("DeepSeek checkpoint has no auxiliary MTP layer")
+        return None
+
+    from mlx_lm.models.deepseek_v3 import ModelArgs
+
+    raw_config: object = getattr(model, "args", None) or getattr(inner, "args", None)
+    raw_embedding: object = getattr(inner, "embed_tokens", None)
+    raw_lm_head: object = getattr(model, "lm_head", None)
+    raw_output_norm: object = getattr(inner, "norm", None)
+    if (
+        raw_config is None
+        or raw_embedding is None
+        or raw_lm_head is None
+        or raw_output_norm is None
+    ):
+        logger.warning("DeepSeek MTP is enabled but model components are incomplete")
+        return None
+
+    config = cast(ModelArgs, raw_config)
+    embedding = cast(nn.Embedding, raw_embedding)
+    lm_head = cast(nn.Linear, raw_lm_head)
+    output_norm = cast(nn.RMSNorm, raw_output_norm)
+
+    # Materialize the auxiliary layer before removing it. This is important for
+    # lazy safetensors loading and ensures every rank owns the same MTP weights.
+    mtp_layer: nn.Module = layers[_MTP_LAYER_INDEX]
+    mx.eval(mtp_layer.parameters())
+    flattened = _flatten_mx_parameter_tree(model.parameters())
+    mtp_weights = extract_mtp_weights(flattened)
+    if not mtp_weights:
+        logger.warning("DeepSeek MTP is enabled but no MTP weights were found")
+        return None
+
+    mtp_module = MTPModule(
+        config=config,
+        shared_embedding=embedding,
+        shared_lm_head=lm_head,
+        output_norm=output_norm,
+    )
+    load_mtp_weights_into_module(mtp_module, mtp_weights)
+    main_layers = layers[:_MTP_LAYER_INDEX]
+    inner.layers = main_layers
+    model.mtp_module = mtp_module
+    mx.eval(mtp_module.parameters())
+    logger.info(
+        f"DeepSeek MTP enabled: extracted layer {_MTP_LAYER_INDEX}; "
+        f"main model now has {len(main_layers)} layers"
+    )
+    return mtp_module
+
+
+def _maybe_attach_mtp(model: nn.Module) -> None:
+    if not MTP_ENABLED:
+        return
+    try:
+        _extract_deepseek_mtp_module(model)
+    except Exception:
+        logger.opt(exception=True).warning(
+            "MTP initialization failed; continuing with standard decoding"
+        )
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -172,7 +317,10 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
+        if MTP_ENABLED:
+            _patch_deepseek_sanitize_for_mtp()
         model, _ = load_model(model_path, lazy=True, strict=False)
+        _maybe_attach_mtp(model)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,7 +383,10 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
+    if MTP_ENABLED:
+        _patch_deepseek_sanitize_for_mtp()
     model, _ = load_model(model_path, lazy=True, strict=False)
+    _maybe_attach_mtp(model)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

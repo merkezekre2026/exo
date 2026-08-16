@@ -83,7 +83,15 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
+        mtp_ready = os.environ.get("EXO_MTP_ENABLED") == "1" and hasattr(
+            self.inference_model, "mtp_module"
+        )
+        if mtp_ready:
+            logger.info(
+                "using SequentialGenerator for MTP; distributed token consensus "
+                "requires one active request per model instance"
+            )
+        if os.environ.get("EXO_NO_BATCH") or mtp_ready:
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,

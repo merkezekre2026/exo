@@ -86,3 +86,19 @@ DEFAULT_TOP_LOGPROBS: int = 5
 
 # TODO: We should really make this opt-in, but Kimi requires trust_remote_code=True
 TRUST_REMOTE_CODE: bool = True
+
+# Multi-Token Prediction (MTP) for models that ship an auxiliary prediction
+# layer (currently DeepSeek V3). It is opt-in because loading the auxiliary
+# layer adds memory pressure on every distributed rank.
+MTP_ENABLED: bool = os.environ.get("EXO_MTP_ENABLED", "0") == "1"
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+MTP_NUM_DRAFT_TOKENS: int = _positive_int_from_env("EXO_MTP_NUM_DRAFT_TOKENS", 1)

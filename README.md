@@ -363,6 +363,8 @@ exo supports several environment variables for configuration:
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
+| `EXO_MTP_ENABLED` | Enable DeepSeek V3 Multi-Token Prediction; on distributed instances every rank participates in token consensus | `false` |
+| `EXO_MTP_NUM_DRAFT_TOKENS` | Number of MTP draft tokens; DeepSeek V3 currently supports one auxiliary draft token | `1` |
 
 **Example usage:**
 
@@ -381,7 +383,26 @@ EXO_ENABLE_IMAGE_MODELS=true uv run exo
 
 # Use custom namespace for cluster isolation
 EXO_LIBP2P_NAMESPACE=my-dev-cluster uv run exo
+
+# Enable DeepSeek V3 MTP on an existing two-device tensor or pipeline instance.
+# MTP is opt-in and automatically uses the distributed model's MLX group.
+EXO_MTP_ENABLED=1 EXO_MTP_NUM_DRAFT_TOKENS=1 uv run exo
 ```
+
+### Distributed MTP notes
+
+MTP is currently implemented for DeepSeek V3 checkpoints that contain the
+auxiliary `model.layers.61` block. The loader extracts that block before
+pipeline or tensor sharding, then creates the same auxiliary module on every
+rank. During generation, sampled draft and target token IDs are reduced through
+rank 0 before cache acceptance or rollback, so a two-device request cannot
+enter different speculative branches because of small numerical differences.
+
+When MTP is enabled, exo selects the sequential generator for that model
+instance. This is intentional: the main model remains distributed across all
+ranks, while the single active request keeps the speculative cache state in
+lock-step. Prefix-cache, remote-prefill, and vision requests continue through
+standard decoding until their cache-transfer paths are MTP-aware.
 
 ---
 

@@ -6,6 +6,7 @@ import uuid
 from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
@@ -54,6 +55,8 @@ from exo.worker.engines.mlx.constants import (
     KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+    MTP_ENABLED,
+    MTP_NUM_DRAFT_TOKENS,
     get_prefill_step_size,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
@@ -619,6 +622,33 @@ def mlx_generate(
         top_k=task.top_k if task.top_k is not None else 0,
     )
 
+    mtp_module = getattr(model, "mtp_module", None)
+    if (
+        MTP_ENABLED
+        and mtp_module is not None
+        and prefix_hit_length == 0
+        and task.prefill_endpoint is None
+        and vision is None
+    ):
+        # MTP is intentionally routed through the sequential path. All ranks
+        # still execute the same main-model collectives, while the replicated
+        # auxiliary module makes draft decisions deterministic via group
+        # consensus. Prefix-cache and remote-prefill paths remain on standard
+        # decoding until their cache-transfer semantics are MTP-aware.
+        mx_barrier(group)
+        yield from _mlx_generate_with_mtp(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            task=task,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=caches,
+            group=group,
+            on_generation_token=on_generation_token,
+        )
+        return
+
     # Normalize stop sequences to a list
     stop_sequences: list[str] = (
         ([task.stop] if isinstance(task.stop, str) else task.stop)
@@ -825,3 +855,130 @@ def mlx_generate(
         # Limit accumulated_text to what's needed for stop sequence detection
         if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
             accumulated_text = accumulated_text[-max_stop_len:]
+
+
+
+def _mlx_generate_with_mtp(
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    prompt: str,
+    task: TextGenerationTaskParams,
+    sampler: Callable[[mx.array], mx.array],
+    logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
+    prompt_cache: KVCacheType,
+    group: mx.distributed.Group | None,
+    on_generation_token: Callable[[], None] | None,
+) -> Generator[GenerationResponse]:
+    """Run DeepSeek MTP and adapt its streamed output to exo responses.
+
+    The MTP module is replicated on every rank, but the target model remains
+    the already-loaded tensor/pipeline-sharded model. The speculative helper
+    synchronizes sampled token ids through ``group`` before it mutates or
+    rolls back any cache, which keeps a two-device request lock-step safe.
+    """
+    from exo.worker.engines.mlx.mtp.speculative_decode import (
+        mtp_speculative_generate,
+    )
+
+    mtp_module = cast(nn.Module, model.mtp_module)
+    stop_sequences = _stop_sequences(task)
+    max_stop_len = max((len(sequence) for sequence in stop_sequences), default=0)
+    accumulated_text = ""
+    all_prompt_tokens = encode_prompt(tokenizer, prompt)
+    generation_start_time = time.perf_counter()
+
+    for completion_tokens, out in enumerate(
+        mtp_speculative_generate(
+            model=model,
+            mtp_module=mtp_module,  # type: ignore[arg-type]
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=task.max_output_tokens or MAX_TOKENS,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=cast(list[object], prompt_cache),
+            num_draft_tokens=MTP_NUM_DRAFT_TOKENS,
+            prefill_step_size=get_prefill_step_size(),
+            kv_group_size=KV_GROUP_SIZE or 64,
+            kv_bits=KV_BITS,
+            group=group,
+        ),
+        start=1,
+    ):
+        accumulated_text += out.text
+        text = out.text
+        finish_reason: FinishReason | None = cast(
+            FinishReason | None, out.finish_reason
+        )
+        stop_matched = False
+
+        for stop_sequence in stop_sequences:
+            if stop_sequence in accumulated_text:
+                stop_index = accumulated_text.find(stop_sequence)
+                text_before_stop = accumulated_text[:stop_index]
+                chunk_start = len(accumulated_text) - len(out.text)
+                text = text_before_stop[chunk_start:]
+                finish_reason = "stop"
+                stop_matched = True
+                break
+
+        if not stop_matched and max_stop_len > 0:
+            accumulated_text = accumulated_text[-max_stop_len:]
+
+        logprob: float | None = None
+        top_logprobs: list[TopLogprobItem] | None = None
+        if task.logprobs:
+            with mx.stream(generation_stream):
+                logprob, top_logprobs = extract_top_logprobs(
+                    logprobs=out.logprobs,
+                    tokenizer=tokenizer,
+                    top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
+                    selected_token=out.token,
+                )
+
+        stats: GenerationStats | None = None
+        usage: Usage | None = None
+        if finish_reason is not None:
+            elapsed = time.perf_counter() - generation_start_time
+            stats = GenerationStats(
+                prompt_tps=float(out.prompt_tps),
+                generation_tps=(completion_tokens / elapsed if elapsed > 0 else 0.0),
+                prompt_tokens=len(all_prompt_tokens),
+                generation_tokens=completion_tokens,
+                peak_memory_usage=Memory.from_gb(out.peak_memory),
+            )
+            usage = Usage(
+                prompt_tokens=len(all_prompt_tokens),
+                completion_tokens=completion_tokens,
+                total_tokens=len(all_prompt_tokens) + completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
+            )
+
+        if on_generation_token is not None:
+            on_generation_token()
+
+        yield GenerationResponse(
+            text=text,
+            token=out.token,
+            logprob=logprob,
+            top_logprobs=top_logprobs,
+            finish_reason=finish_reason,
+            stats=stats,
+            usage=usage,
+        )
+
+        if finish_reason is not None:
+            mx_barrier(group)
+            break
+        if stop_matched:
+            mx_barrier(group)
+            break
+
+
+def _stop_sequences(task: TextGenerationTaskParams) -> tuple[str, ...]:
+    if task.stop is None:
+        return ()
+    if isinstance(task.stop, str):
+        return (task.stop,)
+    return tuple(task.stop)
