@@ -26,7 +26,7 @@ def get_prefill_step_size_for_memory(memory_size_bytes: int | None) -> int:
 def _cuda_memory_size() -> int | None:
     """Return the active CUDA device memory size when MLX exposes it."""
     try:
-        import mlx.core as mx  # pyright: ignore[reportMissingModuleSource]
+        import mlx.core as mx
 
         if not mx.cuda.is_available():
             return None
@@ -60,7 +60,7 @@ def get_prefill_step_size() -> int:
             return value
 
     try:
-        import mlx.core as mx  # pyright: ignore[reportMissingModuleSource]
+        import mlx.core as mx
 
         if mx.cuda.is_available():
             return get_prefill_step_size_for_memory(_cuda_memory_size())

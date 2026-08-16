@@ -361,7 +361,7 @@ def _has_mlx_cuda() -> bool:
     NVIDIA driver but the selected MLX extra is CPU-only.
     """
     try:
-        import mlx.core as mx  # pyright: ignore[reportMissingModuleSource]
+        import mlx.core as mx
     except ImportError:
         return False
 
