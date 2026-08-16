@@ -235,6 +235,12 @@ uv run exo
 
 This starts the exo dashboard and API at http://localhost:52415/. If `MlxCuda` does not appear after selecting a CUDA extra, first confirm `nvidia-smi` and the MLX availability command above. A CPU-only MLX installation intentionally advertises only `MlxCpu`.
 
+#### Linux AppImage
+
+The repository includes a GitHub Actions workflow at `.github/workflows/build-appimage.yml`. Run it manually from the **Actions** tab and select `mlx-cpu`, `mlx-cuda12`, or `mlx-cuda13`; it also runs automatically for `v*` tags. The resulting x86_64 AppImage and SHA-256 checksum are uploaded as workflow artifacts.
+
+The AppImage bundles the Python runtime, MLX package, dashboard, and model resources. NVIDIA drivers and the CUDA kernel driver are host requirements and are not bundled into the AppImage. For a CUDA build, use a host with a compatible NVIDIA driver and select the matching CUDA extra when dispatching the workflow.
+
 **Configuration Options:**
 
 - `--no-worker`: Run exo without the worker component. Useful for coordinator-only nodes that handle networking and orchestration but don't execute inference tasks. This is helpful for machines without sufficient GPU resources but with good network connectivity.
